@@ -25,14 +25,10 @@ class MPVController:
             "position": 0,
             "duration": 0
         }
-        self.previous_state = self.current_state.copy()
         self.ipc_socket = None
         self.observation_thread = None
-        self.state_file_timer_thread = None
         self.stop_observation = False
-        self.stop_state_file_timer = False
         self.state_changed = False
-        self.last_publish_time = 0
         self.publish_interval = self.config["mqtt"].get("publish_interval", 1.0)  # секунды
 
         # State file path
@@ -188,7 +184,9 @@ class MPVController:
         print("Property observation thread started")
 
     def observe_properties(self, callback):
-        """Поток для наблюдения за изменениями свойств MPV"""
+        """Поток для наблюдения за изменениями свойств MPV и обновления файла состояния"""
+        last_update_time = time.time()
+
         while not self.stop_observation and self.ipc_socket:
             try:
                 # Используем select для проверки доступности данных
@@ -205,9 +203,13 @@ class MPVController:
                                     self.state_changed = True
                                 except json.JSONDecodeError:
                                     print(f"Failed to parse JSON: {line}")
-                elif not self.is_playing:
-                    # Если MPV не воспроизводится, прекращаем наблюдение
-                    break
+
+                # Обновляем файл состояния каждую секунду
+                current_time = time.time()
+                if current_time - last_update_time >= 1.0:
+                    self.update_state_file()
+                    last_update_time = current_time
+
             except Exception as e:
                 print(f"Error in observation thread: {e}")
                 time.sleep(1)  # Пауза перед повторной попыткой
@@ -247,21 +249,8 @@ class MPVController:
         """Проверяет, нужно ли публиковать состояние"""
         current_time = time.time()
 
-        # Проверяем, изменилось ли состояние
-        state_changed = (
-            self.current_state["state"] != self.previous_state["state"] or
-            self.current_state["media_content_id"] != self.previous_state["media_content_id"] or
-            self.current_state["media_title"] != self.previous_state["media_title"] or
-            abs(self.current_state["position"] - self.previous_state["position"]) > 0.5 or  # Позиция изменилась более чем на 0.5 сек
-            abs(self.current_state["volume"] - self.previous_state["volume"]) > 1 or  # Громкость изменилась более чем на 1%
-            current_time - self.last_publish_time >= self.publish_interval
-        )
-
-        return state_changed
-
-    def update_previous_state(self):
-        """Обновляет предыдущее состояние"""
-        self.previous_state = self.current_state.copy()
+        # Проверяем, изменилось ли состояние или истек интервал публикации
+        return self.state_changed or (current_time - self.last_publish_time >= self.publish_interval)
 
     def start_mpv_drm(self, state_callback):
         if self.mpv_process and self.mpv_process.poll() is None:
@@ -380,9 +369,6 @@ class MPVController:
                     except Exception as e:
                         print(f"Error applying saved state: {e}")
 
-                # Start state file update timer
-                self.start_state_file_timer()
-
                 print("MPV started successfully with property observation")
                 return True
             else:
@@ -397,13 +383,8 @@ class MPVController:
 
     def update_state_file(self):
         """Updates the JSON state file with current playback info"""
-        if not self.is_playing:
-            # Clear state file when not playing
-            try:
-                if os.path.exists(self.state_file_path):
-                    os.remove(self.state_file_path)
-            except Exception as e:
-                print(f"Error clearing state file: {e}")
+        # Only update if playing and state changed
+        if not self.is_playing or not self.state_changed:
             return
 
         state_data = {
@@ -422,26 +403,8 @@ class MPVController:
         except Exception as e:
             print(f"Error updating state file: {e}")
 
-    def start_state_file_timer(self):
-        """Starts timer to update state file every second"""
-        self.stop_state_file_timer = False
-        def timer_task():
-            while not self.stop_state_file_timer:
-                self.update_state_file()
-                time.sleep(1)
-
-        self.state_file_timer_thread = threading.Thread(target=timer_task)
-        self.state_file_timer_thread.daemon = True
-        self.state_file_timer_thread.start()
-        print("Started state file update timer")
 
     def stop_mpv(self):
-        # Stop state file timer
-        self.stop_state_file_timer = True
-        if self.state_file_timer_thread and self.state_file_timer_thread.is_alive():
-            self.state_file_timer_thread.join(timeout=1.0)
-            print("Stopped state file update timer")
-
         # Останавливаем наблюдение
         self.stop_observation = True
 
@@ -552,8 +515,8 @@ class MQTTClient:
         try:
             if self.controller.is_playing and self.controller.should_publish_state():
                 self.publish_state(self.controller.current_state)
-                self.controller.update_previous_state()
                 self.controller.last_publish_time = time.time()
+                self.controller.state_changed = False  # Сбрасываем флаг изменений
         except Exception as e:
             print(f"Error in publish timer: {e}")
 
@@ -582,7 +545,6 @@ class MQTTClient:
                     print("Playback started successfully")
                     # Принудительно публикуем состояние после запуска
                     self.publish_state(self.controller.current_state)
-                    self.controller.update_previous_state()
                     self.controller.last_publish_time = time.time()
                 else:
                     print("Failed to start playback")
@@ -592,7 +554,6 @@ class MQTTClient:
                 print("Playback stopped")
                 # Принудительно публикуем состояние после остановки
                 self.publish_state(self.controller.current_state)
-                self.controller.update_previous_state()
                 self.controller.last_publish_time = time.time()
 
             elif command == "clear-playlist":
@@ -618,7 +579,6 @@ class MQTTClient:
                     if self.controller.start_mpv_drm(self.publish_state):
                         print("Playlist cleared and playback restarted")
                         self.publish_state(self.controller.current_state)
-                        self.controller.update_previous_state()
                         self.controller.last_publish_time = time.time()
                     else:
                         print("Failed to restart playback after clearing playlist")
